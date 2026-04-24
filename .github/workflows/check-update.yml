@@ -1,0 +1,230 @@
+name: Check ShareMouse Updates
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Pick random User-Agent
+        run: |
+          UAS=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:138.0) Gecko/20100101 Firefox/138.0"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+          )
+          UA="${UAS[$((RANDOM % ${#UAS[@]}))]}"
+          echo "UA=$UA" >> "$GITHUB_ENV"
+          echo "🎲 Selected UA: $UA"
+
+      - name: Detect versions
+        id: detect
+        run: |
+          set -euo pipefail
+
+          html=$(curl -fsSL -A "$UA" "https://www.sharemouse.com/download/")
+
+          win_ver=$(echo "$html" | grep -oP 'Windows Version:</strong>\s*<a[^>]*>\K[0-9]+\.[0-9]+\.[0-9]+' || true)
+          mac_ver=$(echo "$html" | grep -oP 'Mac Version:</strong>\s*<a[^>]*>\K[0-9]+\.[0-9]+\.[0-9]+' || true)
+
+          # Fallback: changelog tables
+          if [[ -z "$win_ver" ]]; then
+            cl=$(curl -fsSL -A "$UA" "https://www.sharemouse.com/download/changelog/")
+            win_ver=$(echo "$cl" | grep -oP '<td>\s*\K[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          fi
+          if [[ -z "$mac_ver" ]]; then
+            cl=$(curl -fsSL -A "$UA" "https://www.sharemouse.com/download/changelog-mac/")
+            mac_ver=$(echo "$cl" | grep -oP '<td>\s*\K[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          fi
+
+          if [[ -z "$win_ver" && -z "$mac_ver" ]]; then
+            echo "::error::Could not detect any version"
+            exit 1
+          fi
+
+          echo "win_ver=${win_ver}" >> "$GITHUB_OUTPUT"
+          echo "mac_ver=${mac_ver}" >> "$GITHUB_OUTPUT"
+          echo "📌 Windows: ${win_ver:-N/A}  |  macOS: ${mac_ver:-N/A}"
+
+      - name: Process releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          win_ver="${{ steps.detect.outputs.win_ver }}"
+          mac_ver="${{ steps.detect.outputs.mac_ver }}"
+          BASE="https://www.sharemouse.com"
+
+          # Per-platform: version + marker file to detect presence in release
+          declare -A PLATFORM_VER=( [win]="$win_ver" [mac]="$mac_ver" )
+          declare -A PLATFORM_MARKER=( [win]="ShareMouseSetup.exe" [mac]="ShareMouseSetup.dmg" )
+
+          # Collect work: WORK[version]="win mac" etc.
+          declare -A WORK
+
+          for plat in win mac; do
+            ver="${PLATFORM_VER[$plat]}"
+            [[ -z "$ver" ]] && continue
+            marker="${PLATFORM_MARKER[$plat]}"
+
+            if gh release view "$ver" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
+              assets=$(gh release view "$ver" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+              if echo "$assets" | grep -q "$marker"; then
+                echo "⏭️  $plat v$ver already in release"
+                continue
+              fi
+              echo "📦 Release $ver exists but missing $plat, will update"
+            else
+              echo "🆕 No release $ver, will create for $plat"
+            fi
+            WORK[$ver]="${WORK[$ver]:-} $plat"
+          done
+
+          if [[ ${#WORK[@]} -eq 0 ]]; then
+            echo "✅ All platforms up to date"
+            exit 0
+          fi
+
+          # ── Changelog scraper ──
+          SCRAPER=$(mktemp /tmp/scrape_XXXX.py)
+          cat > "$SCRAPER" << 'PYEOF'
+          import sys, re, urllib.request
+          version, ua = sys.argv[1], sys.argv[2]
+          platforms = {
+              "win": ("🪟 Windows", "https://www.sharemouse.com/download/changelog/"),
+              "mac": ("🍎 macOS", "https://www.sharemouse.com/download/changelog-mac/"),
+          }
+          out = []
+          for key in sys.argv[3:]:
+              label, url = platforms[key]
+              req = urllib.request.Request(url, headers={"User-Agent": ua})
+              html = urllib.request.urlopen(req).read().decode("utf-8", errors="replace").replace("\n"," ").replace("\r"," ")
+              pat = r"<tr>\s*<td>\s*([^<]*?)\s*<td>\s*" + re.escape(version) + r"\s*<td>(.*?)(?=<tr>|</tbody>|</table>)"
+              m = re.search(pat, html)
+              out.append(f"## {label} Changelog\n")
+              if not m:
+                  out.append(f"  - No entry found for {key} v{version}\n")
+                  continue
+              d = m.group(1).strip()
+              if d: out.append(f"  📅 Released: {d}\n")
+              items = re.findall(r'<li\s+class="([^"]*)"[^>]*>(.*?)(?=</li>|<li\s|</ul>)', m.group(2))
+              if not items:
+                  for t in re.findall(r'<p>([^<]+)', m.group(2)):
+                      out.append(f"  • {t.strip()}")
+              else:
+                  for cls, raw in items:
+                      t = re.sub(r'<[^>]+>', '', raw).strip()
+                      if not t: continue
+                      if "clfix" in cls: out.append(f"  🔧 {t}")
+                      elif "clnew" in cls: out.append(f"  ✨ {t}")
+                      else: out.append(f"  • {t}")
+              out.append("")
+          print("\n".join(out))
+          PYEOF
+
+          # ── Process each version ──
+          for ver in "${!WORK[@]}"; do
+            adding="${WORK[$ver]}"
+            echo "━━━ $ver: adding$adding ━━━"
+            workdir=$(mktemp -d)
+
+            release_exists=false
+            gh release view "$ver" --repo "$GITHUB_REPOSITORY" &>/dev/null && release_exists=true
+
+            # Full platform list = existing + new (deduplicated)
+            all_plats="$adding"
+            if $release_exists; then
+              assets=$(gh release view "$ver" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+              echo "$assets" | grep -q "ShareMouseSetup.exe" && all_plats="$all_plats win"
+              echo "$assets" | grep -q "ShareMouseSetup.dmg" && all_plats="$all_plats mac"
+              all_plats=$(echo "$all_plats" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
+            fi
+
+            # Download NEW platform files
+            new_files=()
+            for p in $adding; do
+              case "$p" in
+                win)
+                  curl -fSL -A "$UA" -o "$workdir/ShareMouseSetup.exe" "${BASE}/ShareMouseSetup.exe"
+                  curl -fSL -A "$UA" -o "$workdir/ShareMouse_USB.zip" "${BASE}/ShareMouse_USB.zip"
+                  new_files+=("$workdir/ShareMouseSetup.exe" "$workdir/ShareMouse_USB.zip")
+                  ;;
+                mac)
+                  curl -fSL -A "$UA" -o "$workdir/ShareMouseSetup.dmg" "${BASE}/ShareMouseSetup.dmg"
+                  curl -fSL -A "$UA" -o "$workdir/ShareMouseMac.zip" "${BASE}/ShareMouseMac.zip"
+                  new_files+=("$workdir/ShareMouseSetup.dmg" "$workdir/ShareMouseMac.zip")
+                  ;;
+              esac
+            done
+
+            # Checksum rows for new files
+            new_rows=""
+            for f in "${new_files[@]}"; do
+              fname=$(basename "$f")
+              sz=$(stat --format='%s' "$f")
+              if (( sz >= 1048576 )); then
+                szh="$(awk "BEGIN{printf \"%.1f\", $sz/1048576}") MB"
+              else
+                szh="$(awk "BEGIN{printf \"%.1f\", $sz/1024}") KB"
+              fi
+              sha=$(sha256sum "$f" | awk '{print $1}')
+              new_rows="${new_rows}| \`${fname}\` | ${szh} | \`${sha}\` |"$'\n'
+            done
+
+            # Changelog for ALL platforms in this version
+            changelog=$(python3 "$SCRAPER" "$ver" "$UA" $all_plats 2>&1 || echo "  - Changelog scraping failed")
+
+            # Merge checksums: keep existing + append new
+            existing_rows=""
+            if $release_exists; then
+              existing_rows=$(gh release view "$ver" --repo "$GITHUB_REPOSITORY" --json body -q '.body' | grep '^| `Share' || true)
+            fi
+
+            {
+              echo "# ShareMouse ${ver}"
+              echo ""
+              echo "$changelog"
+              echo ""
+              echo "---"
+              echo ""
+              echo "## 📦 File Checksums"
+              echo ""
+              echo "| File | Size | SHA-256 |"
+              echo "|------|------|---------|"
+              [[ -n "$existing_rows" ]] && echo "$existing_rows"
+              echo -n "$new_rows"
+              echo ""
+              echo "---"
+              echo ""
+              echo "*Mirrored from [sharemouse.com/download](https://www.sharemouse.com/download/)*"
+            } > "$workdir/notes.md"
+
+            cat "$workdir/notes.md"
+
+            if $release_exists; then
+              gh release upload "$ver" --repo "$GITHUB_REPOSITORY" "${new_files[@]}"
+              gh release edit "$ver" --repo "$GITHUB_REPOSITORY" --notes-file "$workdir/notes.md"
+              echo "🔄 Updated $ver with$adding"
+            else
+              gh release create "$ver" --repo "$GITHUB_REPOSITORY" --title "$ver" --notes-file "$workdir/notes.md" "${new_files[@]}"
+              echo "🎉 Created $ver"
+            fi
+
+            rm -rf "$workdir"
+          done
+          rm -f "$SCRAPER"
