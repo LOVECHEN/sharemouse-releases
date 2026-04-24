@@ -2,7 +2,6 @@ name: Check ShareMouse Updates
 
 on:
   schedule:
-    # Daily at 08:00 UTC
     - cron: '0 8 * * *'
   workflow_dispatch:
 
@@ -19,197 +18,226 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fetch current version from ShareMouse
-        id: fetch
+      - name: Detect versions
+        id: detect
         run: |
           set -euo pipefail
 
           html=$(curl -fsSL -A "$UA" "https://www.sharemouse.com/download/")
 
-          # Debug: show a snippet around "Version"
-          echo "--- page snippet ---"
-          echo "$html" | grep -i "version" | head -5 || true
-          echo "--- end snippet ---"
+          # Page contains:
+          #   <strong>Windows Version:</strong> <a href='...'>7.0.22</a>
+          #   <strong>Mac Version:</strong> <a href='...'>7.0.22</a>
+          win_ver=$(echo "$html" | grep -oP 'Windows Version:</strong>\s*<a[^>]*>\K[0-9]+\.[0-9]+\.[0-9]+' || true)
+          mac_ver=$(echo "$html" | grep -oP 'Mac Version:</strong>\s*<a[^>]*>\K[0-9]+\.[0-9]+\.[0-9]+' || true)
 
-          # The download page contains text like:
-          #   Windows Version: <a ...>7.0.22</a> ... Mac Version: 7.0.22
-          # Extract with perl-style grep (Ubuntu has grep -P)
-          version=$(echo "$html" | grep -oP '(?:Windows|Mac)\s+Version:\s*(?:<[^>]*>)?\s*\K[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-
-          # Fallback 1: look for bare version pattern near "Version"
-          if [[ -z "$version" ]]; then
-            version=$(echo "$html" | grep -i "version" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          # Fallback: changelog tables
+          if [[ -z "$win_ver" ]]; then
+            cl=$(curl -fsSL -A "$UA" "https://www.sharemouse.com/download/changelog/")
+            win_ver=$(echo "$cl" | grep -oP '<td>\s*\K[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          fi
+          if [[ -z "$mac_ver" ]]; then
+            cl=$(curl -fsSL -A "$UA" "https://www.sharemouse.com/download/changelog-mac/")
+            mac_ver=$(echo "$cl" | grep -oP '<td>\s*\K[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
           fi
 
-          # Fallback 2: scrape the changelog page which has <td>VERSION in a table
-          if [[ -z "$version" ]]; then
-            cl_html=$(curl -fsSL -A "$UA" "https://www.sharemouse.com/download/changelog/")
-            version=$(echo "$cl_html" | grep -oP '<td>\s*\K[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-          fi
-
-          if [[ -z "$version" ]]; then
-            echo "::error::Could not detect ShareMouse version from any source"
+          if [[ -z "$win_ver" && -z "$mac_ver" ]]; then
+            echo "::error::Could not detect any version"
             exit 1
           fi
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "📌 Detected ShareMouse version: $version"
+          echo "win_ver=${win_ver}" >> "$GITHUB_OUTPUT"
+          echo "mac_ver=${mac_ver}" >> "$GITHUB_OUTPUT"
+          echo "📌 Windows: ${win_ver:-N/A}  |  macOS: ${mac_ver:-N/A}"
 
-      - name: Check if release already exists
-        id: check
+          # Determine which releases to create
+          # Collect unique version numbers that need new releases
+          versions_to_release=""
+
+          for ver in "$win_ver" "$mac_ver"; do
+            [[ -z "$ver" ]] && continue
+            # Deduplicate
+            if [[ "$versions_to_release" != *"$ver"* ]]; then
+              versions_to_release="${versions_to_release} ${ver}"
+            fi
+          done
+
+          echo "versions_to_release=$(echo $versions_to_release | xargs)" >> "$GITHUB_OUTPUT"
+
+      - name: Check existing releases & build matrix
+        id: matrix
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          version="${{ steps.fetch.outputs.version }}"
-
-          if gh release view "$version" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "⏭️  Release $version already exists, skipping."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "🆕 New version $version detected!"
-          fi
-
-      - name: Download files
-        if: steps.check.outputs.exists == 'false'
-        run: |
           set -euo pipefail
-          mkdir -p release
-          cd release
+          win_ver="${{ steps.detect.outputs.win_ver }}"
+          mac_ver="${{ steps.detect.outputs.mac_ver }}"
 
-          BASE="https://www.sharemouse.com"
-          FILES="ShareMouseSetup.exe ShareMouse_USB.zip ShareMouseSetup.dmg ShareMouseMac.zip"
+          need_release="false"
+          new_versions=""
 
-          for fname in $FILES; do
-            echo "⬇️  Downloading $fname ..."
-            curl -fSL -A "$UA" -o "$fname" "${BASE}/${fname}"
-            echo "   ✅ $(stat --format='%s' "$fname") bytes"
+          for ver in ${{ steps.detect.outputs.versions_to_release }}; do
+            if gh release view "$ver" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
+              echo "⏭️  Release $ver already exists"
+            else
+              echo "🆕 New version: $ver"
+              new_versions="${new_versions} ${ver}"
+              need_release="true"
+            fi
           done
 
-      - name: Generate checksums and file info
-        if: steps.check.outputs.exists == 'false'
+          echo "need_release=${need_release}" >> "$GITHUB_OUTPUT"
+          echo "new_versions=$(echo $new_versions | xargs)" >> "$GITHUB_OUTPUT"
+
+      - name: Download and release
+        if: steps.matrix.outputs.need_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          cd release
 
-          {
-            echo "## 📦 File Checksums"
-            echo ""
-            echo "| File | Size | SHA-256 |"
-            echo "|------|------|---------|"
-            for f in ShareMouseSetup.exe ShareMouse_USB.zip ShareMouseSetup.dmg ShareMouseMac.zip; do
-              if [[ -f "$f" ]]; then
+          win_ver="${{ steps.detect.outputs.win_ver }}"
+          mac_ver="${{ steps.detect.outputs.mac_ver }}"
+          BASE="https://www.sharemouse.com"
+
+          for ver in ${{ steps.matrix.outputs.new_versions }}; do
+            echo "━━━ Processing version $ver ━━━"
+            workdir=$(mktemp -d)
+
+            # Determine which platform files to download
+            grab_win=false
+            grab_mac=false
+            [[ "$win_ver" == "$ver" ]] && grab_win=true
+            [[ "$mac_ver" == "$ver" ]] && grab_mac=true
+
+            files=()
+
+            if $grab_win; then
+              echo "⬇️  ShareMouseSetup.exe"
+              curl -fSL -A "$UA" -o "$workdir/ShareMouseSetup.exe" "${BASE}/ShareMouseSetup.exe"
+              echo "⬇️  ShareMouse_USB.zip"
+              curl -fSL -A "$UA" -o "$workdir/ShareMouse_USB.zip" "${BASE}/ShareMouse_USB.zip"
+              files+=("$workdir/ShareMouseSetup.exe" "$workdir/ShareMouse_USB.zip")
+            fi
+
+            if $grab_mac; then
+              echo "⬇️  ShareMouseSetup.dmg"
+              curl -fSL -A "$UA" -o "$workdir/ShareMouseSetup.dmg" "${BASE}/ShareMouseSetup.dmg"
+              echo "⬇️  ShareMouseMac.zip"
+              curl -fSL -A "$UA" -o "$workdir/ShareMouseMac.zip" "${BASE}/ShareMouseMac.zip"
+              files+=("$workdir/ShareMouseSetup.dmg" "$workdir/ShareMouseMac.zip")
+            fi
+
+            # ── Checksums table ──
+            {
+              echo "## 📦 File Checksums"
+              echo ""
+              echo "| File | Size | SHA-256 |"
+              echo "|------|------|---------|"
+              for f in "${files[@]}"; do
+                fname=$(basename "$f")
                 size_bytes=$(stat --format='%s' "$f")
                 if (( size_bytes >= 1048576 )); then
                   size_human="$(awk "BEGIN{printf \"%.1f\", $size_bytes/1048576}") MB"
-                elif (( size_bytes >= 1024 )); then
-                  size_human="$(awk "BEGIN{printf \"%.1f\", $size_bytes/1024}") KB"
                 else
-                  size_human="${size_bytes} B"
+                  size_human="$(awk "BEGIN{printf \"%.1f\", $size_bytes/1024}") KB"
                 fi
                 sha=$(sha256sum "$f" | awk '{print $1}')
-                echo "| \`$f\` | $size_human | \`$sha\` |"
-              fi
-            done
-          } > /tmp/checksums.md
+                echo "| \`${fname}\` | ${size_human} | \`${sha}\` |"
+              done
+            } > "$workdir/checksums.md"
 
-          cat /tmp/checksums.md
+            # ── Changelog (use a Python script for reliable HTML parsing) ──
+            cat > "$workdir/scrape.py" << 'PYEOF'
+          import sys, re, urllib.request
 
-      - name: Scrape changelog for current version
-        if: steps.check.outputs.exists == 'false'
-        run: |
-          set -euo pipefail
-          version="${{ steps.fetch.outputs.version }}"
-
-          # Changelog pages use <table> with rows:
-          #   <tr><td>DATE<td>VERSION<td><ul><li class="clfix|clnew">TEXT</li></ul><td>
-          get_changelog() {
-            local url="$1" platform="$2"
-            local html
-            html=$(curl -fsSL -A "$UA" "$url")
-
-            # Flatten to single line, extract the <tr> matching our version
-            local flat
-            flat=$(echo "$html" | tr '\n\r' '  ')
-
-            # Use perl for reliable non-greedy extraction
-            local block
-            block=$(echo "$flat" | perl -ne "
-              while (/<tr>\s*<td>([^<]*)<td>\s*${version}\s*<td>(.*?)(?=<tr>|<\/tbody>|<\/table>)/g) {
-                print \"DATE:\$1\n\";
-                # extract li items
-                my \$content = \$2;
-                while (\$content =~ /<li\s+class=\"([^\"]*)\">([^<]+)/g) {
-                  print \"ITEM:\$1|\$2\n\";
-                }
-                # extract <p> items (some entries use <p> instead of <ul>)
-                while (\$content =~ /<p>([^<]+)/g) {
-                  print \"ITEM:clnew|\$1\n\";
-                }
-              }
-            " || true)
-
-            if [[ -z "$block" ]]; then
-              echo "  - No changelog entry found for $platform v${version}"
-              return
-            fi
-
-            # Parse date
-            local date
-            date=$(echo "$block" | grep '^DATE:' | head -1 | sed 's/^DATE://' | xargs)
-            if [[ -n "$date" ]]; then
-              echo "  📅 Released: $date"
-              echo ""
-            fi
-
-            # Parse items
-            echo "$block" | grep '^ITEM:' | sed 's/^ITEM://' | while IFS='|' read -r cls text; do
-              text=$(echo "$text" | xargs)
-              case "$cls" in
-                *clfix*)  echo "  🔧 $text" ;;
-                *clnew*)  echo "  ✨ $text" ;;
-                *)        echo "  • $text" ;;
-              esac
-            done
+          version = sys.argv[1]
+          ua = sys.argv[2]
+          platforms = {
+              "win": ("🪟 Windows", "https://www.sharemouse.com/download/changelog/"),
+              "mac": ("🍎 macOS", "https://www.sharemouse.com/download/changelog-mac/"),
           }
 
-          {
-            echo "# ShareMouse ${version}"
-            echo ""
-            echo "## 🪟 Windows Changelog"
-            echo ""
-            get_changelog "https://www.sharemouse.com/download/changelog/" "Windows"
-            echo ""
-            echo "## 🍎 macOS Changelog"
-            echo ""
-            get_changelog "https://www.sharemouse.com/download/changelog-mac/" "macOS"
-            echo ""
-            echo "---"
-            echo ""
-            cat /tmp/checksums.md
-            echo ""
-            echo "---"
-            echo ""
-            echo "*Mirrored from [sharemouse.com/download](https://www.sharemouse.com/download/)*"
-          } > /tmp/release_notes.md
+          output = []
+          for key in sys.argv[3:]:
+              label, url = platforms[key]
+              req = urllib.request.Request(url, headers={"User-Agent": ua})
+              html = urllib.request.urlopen(req).read().decode("utf-8", errors="replace")
+              html_flat = html.replace("\n", " ").replace("\r", " ")
 
-          echo "--- Release Notes Preview ---"
-          cat /tmp/release_notes.md
+              pattern = (
+                  r"<tr>\s*<td>\s*([^<]*?)\s*<td>\s*"
+                  + re.escape(version)
+                  + r"\s*<td>(.*?)(?=<tr>|</tbody>|</table>)"
+              )
+              m = re.search(pattern, html_flat)
+              output.append(f"## {label} Changelog\n")
+              if not m:
+                  output.append(f"  - No entry found for {key} v{version}\n")
+                  continue
 
-      - name: Create GitHub Release
-        if: steps.check.outputs.exists == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          version="${{ steps.fetch.outputs.version }}"
+              date_str = m.group(1).strip()
+              content = m.group(2)
 
-          gh release create "$version" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "ShareMouse $version" \
-            --notes-file /tmp/release_notes.md \
-            release/ShareMouseSetup.exe \
-            release/ShareMouse_USB.zip \
-            release/ShareMouseSetup.dmg \
-            release/ShareMouseMac.zip
+              if date_str:
+                  output.append(f"  📅 Released: {date_str}\n")
 
-          echo "🎉 Release $version published!"
+              items = re.findall(r'<li\s+class="([^"]*)"[^>]*>([^<]+)', content)
+              if not items:
+                  items_p = re.findall(r'<p>([^<]+)', content)
+                  for t in items_p:
+                      output.append(f"  • {t.strip()}")
+              else:
+                  for cls, text in items:
+                      text = text.strip()
+                      if "clfix" in cls:
+                          output.append(f"  🔧 {text}")
+                      elif "clnew" in cls:
+                          output.append(f"  ✨ {text}")
+                      else:
+                          output.append(f"  • {text}")
+              output.append("")
+
+          print("\n".join(output))
+          PYEOF
+
+            # Build platform list for the scraper
+            scrape_args=""
+            $grab_win && scrape_args="$scrape_args win"
+            $grab_mac && scrape_args="$scrape_args mac"
+
+            changelog=$(python3 "$workdir/scrape.py" "$ver" "$UA" $scrape_args 2>&1 || echo "  - Changelog scraping failed")
+
+            # ── Assemble release notes ──
+            title_parts=""
+            $grab_win && $grab_mac && title_parts="Windows + macOS"
+            $grab_win && ! $grab_mac && title_parts="Windows"
+            ! $grab_win && $grab_mac && title_parts="macOS"
+
+            {
+              echo "# ShareMouse ${ver} (${title_parts})"
+              echo ""
+              echo "$changelog"
+              echo ""
+              echo "---"
+              echo ""
+              cat "$workdir/checksums.md"
+              echo ""
+              echo "---"
+              echo ""
+              echo "*Mirrored from [sharemouse.com/download](https://www.sharemouse.com/download/)*"
+            } > "$workdir/notes.md"
+
+            echo "--- Release Notes ---"
+            cat "$workdir/notes.md"
+
+            # ── Create release ──
+            gh release create "$ver" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "ShareMouse $ver ($title_parts)" \
+              --notes-file "$workdir/notes.md" \
+              "${files[@]}"
+
+            echo "🎉 Release $ver published!"
+            rm -rf "$workdir"
+          done
