@@ -16,7 +16,6 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Pick random User-Agent
-        id: ua
         run: |
           UAS=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
@@ -39,9 +38,6 @@ jobs:
 
           html=$(curl -fsSL -A "$UA" "https://www.sharemouse.com/download/")
 
-          # Page contains:
-          #   <strong>Windows Version:</strong> <a href='...'>7.0.22</a>
-          #   <strong>Mac Version:</strong> <a href='...'>7.0.22</a>
           win_ver=$(echo "$html" | grep -oP 'Windows Version:</strong>\s*<a[^>]*>\K[0-9]+\.[0-9]+\.[0-9]+' || true)
           mac_ver=$(echo "$html" | grep -oP 'Mac Version:</strong>\s*<a[^>]*>\K[0-9]+\.[0-9]+\.[0-9]+' || true)
 
@@ -64,47 +60,7 @@ jobs:
           echo "mac_ver=${mac_ver}" >> "$GITHUB_OUTPUT"
           echo "📌 Windows: ${win_ver:-N/A}  |  macOS: ${mac_ver:-N/A}"
 
-          # Determine which releases to create
-          # Collect unique version numbers that need new releases
-          versions_to_release=""
-
-          for ver in "$win_ver" "$mac_ver"; do
-            [[ -z "$ver" ]] && continue
-            # Deduplicate
-            if [[ "$versions_to_release" != *"$ver"* ]]; then
-              versions_to_release="${versions_to_release} ${ver}"
-            fi
-          done
-
-          echo "versions_to_release=$(echo $versions_to_release | xargs)" >> "$GITHUB_OUTPUT"
-
-      - name: Check existing releases & build matrix
-        id: matrix
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          win_ver="${{ steps.detect.outputs.win_ver }}"
-          mac_ver="${{ steps.detect.outputs.mac_ver }}"
-
-          need_release="false"
-          new_versions=""
-
-          for ver in ${{ steps.detect.outputs.versions_to_release }}; do
-            if gh release view "$ver" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
-              echo "⏭️  Release $ver already exists"
-            else
-              echo "🆕 New version: $ver"
-              new_versions="${new_versions} ${ver}"
-              need_release="true"
-            fi
-          done
-
-          echo "need_release=${need_release}" >> "$GITHUB_OUTPUT"
-          echo "new_versions=$(echo $new_versions | xargs)" >> "$GITHUB_OUTPUT"
-
-      - name: Download and release
-        if: steps.matrix.outputs.need_release == 'true'
+      - name: Process releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -114,119 +70,131 @@ jobs:
           mac_ver="${{ steps.detect.outputs.mac_ver }}"
           BASE="https://www.sharemouse.com"
 
-          for ver in ${{ steps.matrix.outputs.new_versions }}; do
-            echo "━━━ Processing version $ver ━━━"
-            workdir=$(mktemp -d)
+          # Per-platform: version + marker file to detect presence in release
+          declare -A PLATFORM_VER=( [win]="$win_ver" [mac]="$mac_ver" )
+          declare -A PLATFORM_MARKER=( [win]="ShareMouseSetup.exe" [mac]="ShareMouseSetup.dmg" )
 
-            # Determine which platform files to download
-            grab_win=false
-            grab_mac=false
-            [[ "$win_ver" == "$ver" ]] && grab_win=true
-            [[ "$mac_ver" == "$ver" ]] && grab_mac=true
+          # Collect work: WORK[version]="win mac" etc.
+          declare -A WORK
 
-            files=()
+          for plat in win mac; do
+            ver="${PLATFORM_VER[$plat]}"
+            [[ -z "$ver" ]] && continue
+            marker="${PLATFORM_MARKER[$plat]}"
 
-            if $grab_win; then
-              echo "⬇️  ShareMouseSetup.exe"
-              curl -fSL -A "$UA" -o "$workdir/ShareMouseSetup.exe" "${BASE}/ShareMouseSetup.exe"
-              echo "⬇️  ShareMouse_USB.zip"
-              curl -fSL -A "$UA" -o "$workdir/ShareMouse_USB.zip" "${BASE}/ShareMouse_USB.zip"
-              files+=("$workdir/ShareMouseSetup.exe" "$workdir/ShareMouse_USB.zip")
+            if gh release view "$ver" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
+              assets=$(gh release view "$ver" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+              if echo "$assets" | grep -q "$marker"; then
+                echo "⏭️  $plat v$ver already in release"
+                continue
+              fi
+              echo "📦 Release $ver exists but missing $plat, will update"
+            else
+              echo "🆕 No release $ver, will create for $plat"
             fi
+            WORK[$ver]="${WORK[$ver]:-} $plat"
+          done
 
-            if $grab_mac; then
-              echo "⬇️  ShareMouseSetup.dmg"
-              curl -fSL -A "$UA" -o "$workdir/ShareMouseSetup.dmg" "${BASE}/ShareMouseSetup.dmg"
-              echo "⬇️  ShareMouseMac.zip"
-              curl -fSL -A "$UA" -o "$workdir/ShareMouseMac.zip" "${BASE}/ShareMouseMac.zip"
-              files+=("$workdir/ShareMouseSetup.dmg" "$workdir/ShareMouseMac.zip")
-            fi
+          if [[ ${#WORK[@]} -eq 0 ]]; then
+            echo "✅ All platforms up to date"
+            exit 0
+          fi
 
-            # ── Checksums table ──
-            {
-              echo "## 📦 File Checksums"
-              echo ""
-              echo "| File | Size | SHA-256 |"
-              echo "|------|------|---------|"
-              for f in "${files[@]}"; do
-                fname=$(basename "$f")
-                size_bytes=$(stat --format='%s' "$f")
-                if (( size_bytes >= 1048576 )); then
-                  size_human="$(awk "BEGIN{printf \"%.1f\", $size_bytes/1048576}") MB"
-                else
-                  size_human="$(awk "BEGIN{printf \"%.1f\", $size_bytes/1024}") KB"
-                fi
-                sha=$(sha256sum "$f" | awk '{print $1}')
-                echo "| \`${fname}\` | ${size_human} | \`${sha}\` |"
-              done
-            } > "$workdir/checksums.md"
-
-            # ── Changelog (use a Python script for reliable HTML parsing) ──
-            cat > "$workdir/scrape.py" << 'PYEOF'
+          # ── Changelog scraper ──
+          SCRAPER=$(mktemp /tmp/scrape_XXXX.py)
+          cat > "$SCRAPER" << 'PYEOF'
           import sys, re, urllib.request
-
-          version = sys.argv[1]
-          ua = sys.argv[2]
+          version, ua = sys.argv[1], sys.argv[2]
           platforms = {
               "win": ("🪟 Windows", "https://www.sharemouse.com/download/changelog/"),
               "mac": ("🍎 macOS", "https://www.sharemouse.com/download/changelog-mac/"),
           }
-
-          output = []
+          out = []
           for key in sys.argv[3:]:
               label, url = platforms[key]
               req = urllib.request.Request(url, headers={"User-Agent": ua})
-              html = urllib.request.urlopen(req).read().decode("utf-8", errors="replace")
-              html_flat = html.replace("\n", " ").replace("\r", " ")
-
-              pattern = (
-                  r"<tr>\s*<td>\s*([^<]*?)\s*<td>\s*"
-                  + re.escape(version)
-                  + r"\s*<td>(.*?)(?=<tr>|</tbody>|</table>)"
-              )
-              m = re.search(pattern, html_flat)
-              output.append(f"## {label} Changelog\n")
+              html = urllib.request.urlopen(req).read().decode("utf-8", errors="replace").replace("\n"," ").replace("\r"," ")
+              pat = r"<tr>\s*<td>\s*([^<]*?)\s*<td>\s*" + re.escape(version) + r"\s*<td>(.*?)(?=<tr>|</tbody>|</table>)"
+              m = re.search(pat, html)
+              out.append(f"## {label} Changelog\n")
               if not m:
-                  output.append(f"  - No entry found for {key} v{version}\n")
+                  out.append(f"  - No entry found for {key} v{version}\n")
                   continue
-
-              date_str = m.group(1).strip()
-              content = m.group(2)
-
-              if date_str:
-                  output.append(f"  📅 Released: {date_str}\n")
-
-              # Match <li class="clfix">text or <li class="clfix"><span>text</span>
-              items = re.findall(r'<li\s+class="([^"]*)"[^>]*>(.*?)(?=</li>|<li\s|</ul>)', content)
+              d = m.group(1).strip()
+              if d: out.append(f"  📅 Released: {d}\n")
+              items = re.findall(r'<li\s+class="([^"]*)"[^>]*>(.*?)(?=</li>|<li\s|</ul>)', m.group(2))
               if not items:
-                  items_p = re.findall(r'<p>([^<]+)', content)
-                  for t in items_p:
-                      output.append(f"  • {t.strip()}")
+                  for t in re.findall(r'<p>([^<]+)', m.group(2)):
+                      out.append(f"  • {t.strip()}")
               else:
                   for cls, raw in items:
-                      # Strip all HTML tags to get pure text
-                      text = re.sub(r'<[^>]+>', '', raw).strip()
-                      if not text:
-                          continue
-                      if "clfix" in cls:
-                          output.append(f"  🔧 {text}")
-                      elif "clnew" in cls:
-                          output.append(f"  ✨ {text}")
-                      else:
-                          output.append(f"  • {text}")
-              output.append("")
-
-          print("\n".join(output))
+                      t = re.sub(r'<[^>]+>', '', raw).strip()
+                      if not t: continue
+                      if "clfix" in cls: out.append(f"  🔧 {t}")
+                      elif "clnew" in cls: out.append(f"  ✨ {t}")
+                      else: out.append(f"  • {t}")
+              out.append("")
+          print("\n".join(out))
           PYEOF
 
-            # Build platform list for the scraper
-            scrape_args=""
-            $grab_win && scrape_args="$scrape_args win"
-            $grab_mac && scrape_args="$scrape_args mac"
+          # ── Process each version ──
+          for ver in "${!WORK[@]}"; do
+            adding="${WORK[$ver]}"
+            echo "━━━ $ver: adding$adding ━━━"
+            workdir=$(mktemp -d)
 
-            changelog=$(python3 "$workdir/scrape.py" "$ver" "$UA" $scrape_args 2>&1 || echo "  - Changelog scraping failed")
+            release_exists=false
+            gh release view "$ver" --repo "$GITHUB_REPOSITORY" &>/dev/null && release_exists=true
 
-            # ── Assemble release notes ──
+            # Full platform list = existing + new (deduplicated)
+            all_plats="$adding"
+            if $release_exists; then
+              assets=$(gh release view "$ver" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+              echo "$assets" | grep -q "ShareMouseSetup.exe" && all_plats="$all_plats win"
+              echo "$assets" | grep -q "ShareMouseSetup.dmg" && all_plats="$all_plats mac"
+              all_plats=$(echo "$all_plats" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
+            fi
+
+            # Download NEW platform files
+            new_files=()
+            for p in $adding; do
+              case "$p" in
+                win)
+                  curl -fSL -A "$UA" -o "$workdir/ShareMouseSetup.exe" "${BASE}/ShareMouseSetup.exe"
+                  curl -fSL -A "$UA" -o "$workdir/ShareMouse_USB.zip" "${BASE}/ShareMouse_USB.zip"
+                  new_files+=("$workdir/ShareMouseSetup.exe" "$workdir/ShareMouse_USB.zip")
+                  ;;
+                mac)
+                  curl -fSL -A "$UA" -o "$workdir/ShareMouseSetup.dmg" "${BASE}/ShareMouseSetup.dmg"
+                  curl -fSL -A "$UA" -o "$workdir/ShareMouseMac.zip" "${BASE}/ShareMouseMac.zip"
+                  new_files+=("$workdir/ShareMouseSetup.dmg" "$workdir/ShareMouseMac.zip")
+                  ;;
+              esac
+            done
+
+            # Checksum rows for new files
+            new_rows=""
+            for f in "${new_files[@]}"; do
+              fname=$(basename "$f")
+              sz=$(stat --format='%s' "$f")
+              if (( sz >= 1048576 )); then
+                szh="$(awk "BEGIN{printf \"%.1f\", $sz/1048576}") MB"
+              else
+                szh="$(awk "BEGIN{printf \"%.1f\", $sz/1024}") KB"
+              fi
+              sha=$(sha256sum "$f" | awk '{print $1}')
+              new_rows="${new_rows}| \`${fname}\` | ${szh} | \`${sha}\` |"$'\n'
+            done
+
+            # Changelog for ALL platforms in this version
+            changelog=$(python3 "$SCRAPER" "$ver" "$UA" $all_plats 2>&1 || echo "  - Changelog scraping failed")
+
+            # Merge checksums: keep existing + append new
+            existing_rows=""
+            if $release_exists; then
+              existing_rows=$(gh release view "$ver" --repo "$GITHUB_REPOSITORY" --json body -q '.body' | grep '^| `Share' || true)
+            fi
+
             {
               echo "# ShareMouse ${ver}"
               echo ""
@@ -234,23 +202,29 @@ jobs:
               echo ""
               echo "---"
               echo ""
-              cat "$workdir/checksums.md"
+              echo "## 📦 File Checksums"
+              echo ""
+              echo "| File | Size | SHA-256 |"
+              echo "|------|------|---------|"
+              [[ -n "$existing_rows" ]] && echo "$existing_rows"
+              echo -n "$new_rows"
               echo ""
               echo "---"
               echo ""
               echo "*Mirrored from [sharemouse.com/download](https://www.sharemouse.com/download/)*"
             } > "$workdir/notes.md"
 
-            echo "--- Release Notes ---"
             cat "$workdir/notes.md"
 
-            # ── Create release ──
-            gh release create "$ver" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$ver" \
-              --notes-file "$workdir/notes.md" \
-              "${files[@]}"
+            if $release_exists; then
+              gh release upload "$ver" --repo "$GITHUB_REPOSITORY" "${new_files[@]}"
+              gh release edit "$ver" --repo "$GITHUB_REPOSITORY" --notes-file "$workdir/notes.md"
+              echo "🔄 Updated $ver with$adding"
+            else
+              gh release create "$ver" --repo "$GITHUB_REPOSITORY" --title "$ver" --notes-file "$workdir/notes.md" "${new_files[@]}"
+              echo "🎉 Created $ver"
+            fi
 
-            echo "🎉 Release $ver published!"
             rm -rf "$workdir"
           done
+          rm -f "$SCRAPER"
