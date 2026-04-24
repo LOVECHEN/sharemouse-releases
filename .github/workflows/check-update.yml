@@ -213,13 +213,8 @@ jobs:
             changelog=$(python3 "$workdir/scrape.py" "$ver" "$UA" $scrape_args 2>&1 || echo "  - Changelog scraping failed")
 
             # ── Assemble release notes ──
-            title_parts=""
-            $grab_win && $grab_mac && title_parts="Windows + macOS"
-            $grab_win && ! $grab_mac && title_parts="Windows"
-            ! $grab_win && $grab_mac && title_parts="macOS"
-
             {
-              echo "# ShareMouse ${ver} (${title_parts})"
+              echo "# ShareMouse ${ver}"
               echo ""
               echo "$changelog"
               echo ""
@@ -238,7 +233,7 @@ jobs:
             # ── Create release ──
             gh release create "$ver" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "ShareMouse $ver ($title_parts)" \
+              --title "$ver" \
               --notes-file "$workdir/notes.md" \
               "${files[@]}"
 
