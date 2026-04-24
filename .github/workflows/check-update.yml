@@ -182,14 +182,18 @@ jobs:
               if date_str:
                   output.append(f"  📅 Released: {date_str}\n")
 
-              items = re.findall(r'<li\s+class="([^"]*)"[^>]*>([^<]+)', content)
+              # Match <li class="clfix">text or <li class="clfix"><span>text</span>
+              items = re.findall(r'<li\s+class="([^"]*)"[^>]*>(.*?)(?=</li>|<li\s|</ul>)', content)
               if not items:
                   items_p = re.findall(r'<p>([^<]+)', content)
                   for t in items_p:
                       output.append(f"  • {t.strip()}")
               else:
-                  for cls, text in items:
-                      text = text.strip()
+                  for cls, raw in items:
+                      # Strip all HTML tags to get pure text
+                      text = re.sub(r'<[^>]+>', '', raw).strip()
+                      if not text:
+                          continue
                       if "clfix" in cls:
                           output.append(f"  🔧 {text}")
                       elif "clnew" in cls:
