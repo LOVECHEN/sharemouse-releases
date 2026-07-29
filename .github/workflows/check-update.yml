@@ -75,7 +75,10 @@ jobs:
           declare -A PLATFORM_MARKER=( [win]="ShareMouseSetup.exe" [mac]="ShareMouseSetup.dmg" )
 
           # Collect work: WORK[version]="win mac" etc.
-          declare -A WORK
+          # NB: must be =() so the array counts as "set" — under `set -u`,
+          # a bare `declare -A WORK` with zero elements is treated as unset,
+          # and `${#WORK[@]}` below then aborts with "WORK: unbound variable".
+          declare -A WORK=()
 
           for plat in win mac; do
             ver="${PLATFORM_VER[$plat]}"
